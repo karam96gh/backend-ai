@@ -643,7 +643,7 @@ def get_system_status():
         return jsonify({'error': str(e)}), 500
 
 def train_model_background(config, data_info):
-    """Background training function with enhanced perceptron and MLP support"""
+    """Background training function with enhanced memory management - FIXED"""
     global training_state
     
     try:
@@ -654,14 +654,12 @@ def train_model_background(config, data_info):
         if 'preview' in data_info and 'session_id' in data_info['preview']:
             timestamp = data_info['preview']['session_id']
         elif 'preview' in data_info:
-            # Sometimes the preview data itself contains the session info
             timestamp = data_info['preview'].get('upload_timestamp')
         
         # If still no timestamp, get the most recent session file
         if not timestamp:
             session_files = [f for f in os.listdir(app.config['UPLOAD_FOLDER']) if f.endswith('_session.json')]
             if session_files:
-                # Sort by modification time and get the most recent
                 session_files.sort(key=lambda x: os.path.getmtime(os.path.join(app.config['UPLOAD_FOLDER'], x)), reverse=True)
                 timestamp = session_files[0].split('_session.json')[0]
             else:
@@ -673,44 +671,128 @@ def train_model_background(config, data_info):
         
         filepath = session_data['filepath']
         
-        # Initialize components
-        processor = DataProcessor()
+        # Initialize components with memory optimization
+        processor = DataProcessor(max_memory_gb=4.0)  # Adjust based on available RAM
         builder = ModelBuilder()
         trainer = ModelTrainer()
         
-        # Load and preprocess data
-        X_train, X_val, y_train, y_val, data_info_processed = processor.prepare_training_data(
-            filepath, 
-            config.get('validationSplit', 0.2),
-            config.get('taskType', 'classification')
-        )
+        print(f"🧠 Initializing training with memory optimization")
         
-        # Special handling for perceptron binary classification
+        # Load and preprocess data with memory management
+        try:
+            training_data = processor.prepare_training_data(
+                filepath, 
+                config.get('validationSplit', 0.2),
+                config.get('taskType', 'classification')
+            )
+            
+            # ✅ الإصلاح: تحديد نوع التدريب بشكل صحيح
+            if len(training_data) == 5:
+                X_train, X_val, y_train, y_val, data_info_processed = training_data
+                
+                # 🔍 فحص أفضل لنوع البيانات
+                if hasattr(X_train, '__len__') and hasattr(X_train, '__getitem__') and hasattr(X_train, 'on_epoch_end'):
+                    using_generators = True
+                    print(f"🔄 Using memory-efficient generator-based training")
+                    print(f"📊 Generator steps: Train={len(X_train)}, Val={len(X_val) if X_val else 'None'}")
+                elif hasattr(X_train, 'shape'):
+                    using_generators = False
+                    print(f"📊 Using standard array-based training")
+                    print(f"🔢 Training shape: {X_train.shape}")
+                    if y_train is not None:
+                        print(f"🔢 Training labels shape: {y_train.shape}")
+                else:
+                    # ✅ التعامل مع الحالات الاستثنائية
+                    using_generators = True
+                    print(f"🔄 Detected generator-like object, using generator mode")
+                    print(f"📊 Training data type: {type(X_train).__name__}")
+                
+            else:
+                # ❌ هذا لا يجب أن يحدث مع الكود الجديد
+                raise Exception("Unexpected training data format returned from processor")
+                
+        except MemoryError as me:
+            error_msg = f"Memory allocation failed: {str(me)}\n\n"
+            error_msg += "💡 Memory Optimization Tips:\n"
+            error_msg += "• Try reducing the image dataset size\n"
+            error_msg += "• Use smaller image resolution (current: 224x224)\n"
+            error_msg += "• Close other memory-intensive applications\n"
+            error_msg += "• Consider using a machine with more RAM\n"
+            error_msg += "• Try processing the dataset in smaller batches"
+            
+            training_state['status'] = 'error'
+            training_state['error_message'] = error_msg
+            return
+            
+        except Exception as e:
+            training_state['status'] = 'error'
+            training_state['error_message'] = f"Data preparation failed: {str(e)}"
+            print(f"❌ Data preparation error: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return
+        
+        # Memory optimization for model building
         model_type = config.get('modelType', 'mlp')
-        if model_type == 'perceptron' and data_info_processed.get('num_classes', 1) == 2:
-            # Convert binary labels to 0/1 for binary crossentropy
-            import numpy as np
-            y_train = np.array(y_train, dtype=np.float32)
-            y_val = np.array(y_val, dtype=np.float32)
         
-        # Build model
-        model = builder.build_model(config, data_info_processed)
+        # Adjust batch size based on dataset size and memory
+        original_batch_size = config.get('batchSize', 32)
+        if using_generators:
+            # For generators, we can use smaller batch sizes safely
+            recommended_batch_size = min(original_batch_size, 16)
+            config['batchSize'] = recommended_batch_size
+            print(f"🎛️  Adjusted batch size for generator mode: {recommended_batch_size}")
         
-        # Print model summary for debugging
-        print(f"\n🔍 Model Summary for {model_type.upper()}:")
-        model.summary()
+        # Handle binary classification labels for perceptron and MLP
+        if model_type in ['perceptron', 'mlp'] and data_info_processed.get('num_classes', 1) == 2:
+            if not using_generators and y_train is not None:
+                y_train = np.array(y_train, dtype=np.int32)
+                y_val = np.array(y_val, dtype=np.int32) if y_val is not None else None
+        
+        # Build model with memory considerations
+        try:
+            model = builder.build_model(config, data_info_processed)
+            print(f"🏗️  Model architecture built successfully")
+            
+            # Print model summary for debugging
+            total_params = model.count_params()
+            print(f"📊 Model parameters: {total_params:,}")
+            
+            # Estimate memory usage
+            estimated_memory_mb = total_params * 4 / (1024*1024) * 4  # Rough estimate
+            print(f"💾 Estimated model memory: {estimated_memory_mb:.1f} MB")
+            
+            if estimated_memory_mb > 4000:  # > 4GB
+                print("⚠️  Large model detected - consider reducing complexity")
+            
+        except Exception as e:
+            training_state['status'] = 'error'
+            training_state['error_message'] = f"Model building failed: {str(e)}"
+            print(f"❌ Model building error: {str(e)}")
+            return
         
         # Compile the model
-        model = builder.compile_model(model, config, data_info_processed)
+        try:
+            model = builder.compile_model(model, config, data_info_processed)
+            print(f"⚙️  Model compiled successfully")
+        except Exception as e:
+            training_state['status'] = 'error'
+            training_state['error_message'] = f"Model compilation failed: {str(e)}"
+            print(f"❌ Model compilation error: {str(e)}")
+            return
         
         # Custom callback to update training state
         class ProgressCallback(tf.keras.callbacks.Callback):
             def __init__(self):
                 super().__init__()
                 self.epoch_count = 0
+                self.start_time = time.time()
             
             def on_epoch_begin(self, epoch, logs=None):
-                print(f"Starting epoch {epoch + 1}/{config.get('epochs', 50)}")
+                print(f"🚀 Starting epoch {epoch + 1}/{config.get('epochs', 50)}")
+                # Force garbage collection at the start of each epoch
+                import gc
+                gc.collect()
             
             def on_epoch_end(self, epoch, logs=None):
                 logs = logs or {}
@@ -721,33 +803,65 @@ def train_model_background(config, data_info):
                 # Add to history
                 history_entry = {
                     'epoch': self.epoch_count,
-                    'loss': logs.get('loss', 0),
-                    'accuracy': logs.get('accuracy', 0),
-                    'val_loss': logs.get('val_loss', 0),
-                    'val_accuracy': logs.get('val_accuracy', 0)
+                    'loss': float(logs.get('loss', 0)),
+                    'accuracy': float(logs.get('accuracy', 0)),
+                    'val_loss': float(logs.get('val_loss', 0)),
+                    'val_accuracy': float(logs.get('val_accuracy', 0))
                 }
                 training_state['history'].append(history_entry)
                 
-                # Print progress
-                print(f"Epoch {self.epoch_count}: loss={logs.get('loss', 0):.4f}, "
+                # Calculate ETA
+                elapsed = time.time() - self.start_time
+                epochs_remaining = config.get('epochs', 50) - self.epoch_count
+                eta_seconds = (elapsed / self.epoch_count) * epochs_remaining if self.epoch_count > 0 else 0
+                
+                print(f"✅ Epoch {self.epoch_count}: "
+                      f"loss={logs.get('loss', 0):.4f}, "
                       f"accuracy={logs.get('accuracy', 0):.4f}, "
                       f"val_loss={logs.get('val_loss', 0):.4f}, "
-                      f"val_accuracy={logs.get('val_accuracy', 0):.4f}")
+                      f"val_accuracy={logs.get('val_accuracy', 0):.4f}, "
+                      f"ETA: {eta_seconds/60:.1f}min")
+                
+                # Periodic memory cleanup
+                if self.epoch_count % 5 == 0:
+                    import gc
+                    gc.collect()
+                    print(f"🧹 Memory cleanup performed at epoch {self.epoch_count}")
         
-        # Train model
+        # Train model with memory management
         start_time = time.time()
         try:
-            print(f"\n🚀 Starting {model_type.upper()} training...")
-            print(f"Training data shape: {X_train.shape}")
-            print(f"Training labels shape: {y_train.shape}")
-            print(f"Validation data shape: {X_val.shape}")
-            print(f"Validation labels shape: {y_val.shape}")
+            print(f"\n🚀 Starting {model_type.upper()} training with memory optimization...")
             
+            # ✅ طباعة معلومات صحيحة حسب نوع التدريب
+            if using_generators:
+                print(f"🔄 Generator mode active:")
+                print(f"   📊 Training steps per epoch: {len(X_train)}")
+                print(f"   📊 Validation steps per epoch: {len(X_val) if X_val else 0}")
+                print(f"   🎛️  Batch size: {config.get('batchSize', 32)}")
+                if hasattr(data_info_processed, 'get'):
+                    total_train = data_info_processed.get('train_samples', 'Unknown')
+                    total_val = data_info_processed.get('val_samples', 'Unknown')
+                    print(f"   📈 Total training samples: {total_train}")
+                    print(f"   📉 Total validation samples: {total_val}")
+            else:
+                print(f"📊 Array mode active:")
+                print(f"   🔢 Training data shape: {X_train.shape}")
+                print(f"   🔢 Training labels shape: {y_train.shape}")
+                if X_val is not None:
+                    print(f"   🔢 Validation data shape: {X_val.shape}")
+                    print(f"   🔢 Validation labels shape: {y_val.shape}")
+            
+            # Use the memory-optimized trainer
             history = trainer.train_model(
                 model, X_train, y_train, X_val, y_val, 
                 config, ProgressCallback()
             )
             end_time = time.time()
+            
+            # Force memory cleanup after training
+            import gc
+            gc.collect()
             
             # Calculate final results
             final_results = {
@@ -761,7 +875,9 @@ def train_model_background(config, data_info):
                 'trainable_params': int(model.count_params()) if hasattr(model, 'count_params') else None,
                 'model_size': f"{model.count_params() * 4 / (1024*1024):.2f} MB" if hasattr(model, 'count_params') else None,
                 'convergence_epoch': len(history.history['loss']) if 'loss' in history.history else None,
-                'epochs_completed': len(history.history['loss']) if 'loss' in history.history else 0
+                'epochs_completed': len(history.history['loss']) if 'loss' in history.history else 0,
+                'memory_optimized': using_generators,
+                'batch_size_used': config.get('batchSize', 32)
             }
             
             # Add model-specific insights
@@ -789,7 +905,8 @@ def train_model_background(config, data_info):
                     'decision_boundary': 'Non-linear with spatial awareness',
                     'suitable_for': 'Image classification and computer vision',
                     'advantages': 'Translation invariant feature extraction',
-                    'specialization': 'Spatial data processing'
+                    'specialization': 'Spatial data processing',
+                    'memory_efficient': using_generators
                 }
             
             # Update training state
@@ -800,18 +917,19 @@ def train_model_background(config, data_info):
             training_state['epoch'] = config.get('epochs', 50)
             
             print(f"✅ Training completed successfully!")
-            print(f"Model type: {model_type}")
-            print(f"Final validation accuracy: {final_results.get('final_val_accuracy', 'N/A')}")
-            print(f"Training time: {final_results.get('training_time')}")
+            print(f"🎯 Model type: {model_type}")
+            print(f"📊 Final validation accuracy: {final_results.get('final_val_accuracy', 'N/A')}")
+            print(f"⏱️  Training time: {final_results.get('training_time')}")
+            print(f"🧠 Memory optimized: {using_generators}")
             
-            # Save model
+            # Save model with enhanced metadata
             model_path = os.path.join(app.config['MODELS_FOLDER'], f"model_{timestamp}")
             if hasattr(model, 'save'):
                 os.makedirs(model_path, exist_ok=True)
                 model.save(model_path)
                 print(f"💾 Model saved to: {model_path}")
                 
-                # Save enhanced training metadata
+                # Save comprehensive training metadata
                 metadata = {
                     'session_id': timestamp,
                     'model_type': model_type,
@@ -819,8 +937,7 @@ def train_model_background(config, data_info):
                     'task_type': data_info_processed.get('task_type'),
                     'input_shape': data_info_processed.get('input_shape'),
                     'num_classes': data_info_processed.get('num_classes'),
-                    'final_accuracy': final_results.get('final_val_accuracy'),
-                    'class_names': data_info_processed.get('class_names'),  # ✅ الأسماء الأصلية
+                    'class_names': data_info_processed.get('class_names'),
                     'feature_names': data_info_processed.get('feature_names'),
                     'target_name': data_info_processed.get('target_name'),
                     'final_accuracy': final_results.get('final_val_accuracy'),
@@ -831,43 +948,19 @@ def train_model_background(config, data_info):
                     'framework': 'tensorflow',
                     'model_architecture': model_type.upper(),
                     'version': '2.0',
-                    'supported_models': ['perceptron', 'mlp', 'cnn']
+                    'memory_optimized': using_generators,
+                    'memory_info': {
+                        'used_generators': using_generators,
+                        'batch_size_used': config.get('batchSize', 32),
+                        'estimated_model_size_mb': final_results.get('model_size', 'unknown')
+                    }
                 }
-                
-                # Add class names if available
-                if data_info_processed.get('data_type') == 'images':
-                    try:
-                        session_file = os.path.join(app.config['UPLOAD_FOLDER'], f"{timestamp}_session.json")
-                        if os.path.exists(session_file):
-                            with open(session_file, 'r') as f:
-                                session_data = json.load(f)
-                            preview_data = session_data.get('preview', {})
-                            class_names = preview_data.get('class_names', [])
-                            if class_names:
-                                metadata['class_names'] = class_names
-                    except Exception as e:
-                        print(f"Warning: Could not load class names: {e}")
-                
-                # Add feature names for tabular data
-                elif data_info_processed.get('data_type') == 'tabular':
-                    try:
-                        session_file = os.path.join(app.config['UPLOAD_FOLDER'], f"{timestamp}_session.json")
-                        if os.path.exists(session_file):
-                            with open(session_file, 'r') as f:
-                                session_data = json.load(f)
-                            preview_data = session_data.get('preview', {})
-                            column_names = preview_data.get('column_names', [])
-                            if column_names:
-                                metadata['feature_names'] = column_names[:-1]  # Exclude target
-                                metadata['target_name'] = column_names[-1]
-                    except Exception as e:
-                        print(f"Warning: Could not load feature names: {e}")
                 
                 metadata_file = os.path.join(model_path, 'training_metadata.json')
                 with open(metadata_file, 'w') as f:
                     json.dump(metadata, f, indent=2)
                 
-                # Try to save preprocessing objects if available
+                # Save preprocessing objects if available
                 try:
                     if hasattr(processor, 'scaler') and processor.scaler:
                         import pickle
@@ -885,45 +978,88 @@ def train_model_background(config, data_info):
                 except Exception as e:
                     print(f"⚠️ Warning: Could not save preprocessing objects: {e}")
                 
+        except MemoryError as training_error:
+            end_time = time.time()
+            training_state['status'] = 'error'
+            error_message = f"Training failed due to memory limitations: {str(training_error)}\n\n"
+            error_message += "🧠 Memory Optimization Suggestions:\n"
+            
+            if model_type == 'cnn':
+                error_message += "• Reduce batch size (try 8 or 16)\n"
+                error_message += "• Use smaller image resolution (try 128x128)\n"
+                error_message += "• Reduce number of filters in CNN layers\n"
+                error_message += "• Enable data generators for large datasets\n"
+            elif model_type == 'mlp':
+                error_message += "• Reduce hidden layer sizes\n"
+                error_message += "• Reduce batch size\n"
+                error_message += "• Use fewer hidden layers\n"
+            
+            error_message += "• Close other applications to free up RAM\n"
+            error_message += "• Consider using a machine with more memory\n"
+            error_message += "• Try training on a smaller subset of data first"
+            
+            training_state['error_message'] = error_message
+            print(f"❌ Memory error: {str(training_error)}")
+            
         except Exception as training_error:
             end_time = time.time()
             training_state['status'] = 'error'
-            error_message = f"Training failed: {str(training_error)}"
+            error_message = f"Training failed: {str(training_error)}\n\n"
             
             # Add model-specific error context
             if config.get('modelType') == 'perceptron':
-                error_message += "\n\n🔧 Perceptron Training Tips:\n"
+                error_message += "🔧 Perceptron Training Tips:\n"
                 error_message += "• Ensure data is linearly separable\n"
                 error_message += "• Use binary classification only\n"
                 error_message += "• Try lower learning rates (0.01-0.1)\n"
                 error_message += "• Consider using MLP for complex patterns"
             elif config.get('modelType') == 'mlp':
-                error_message += "\n\n🔧 MLP Training Tips:\n"
+                error_message += "🔧 MLP Training Tips:\n"
                 error_message += "• Try adjusting the number of hidden layers\n"
                 error_message += "• Experiment with different activation functions\n"
                 error_message += "• Consider adding dropout for regularization\n"
-                error_message += "• Reduce learning rate if training is unstable"
+                error_message += "• Reduce learning rate if training is unstable\n"
+                error_message += "• Try smaller batch sizes for memory issues"
             elif config.get('modelType') == 'cnn':
-                error_message += "\n\n🔧 CNN Training Tips:\n"
+                error_message += "🔧 CNN Training Tips:\n"
                 error_message += "• Ensure sufficient training data\n"
                 error_message += "• Try data augmentation for better generalization\n"
                 error_message += "• Adjust filter sizes and counts\n"
-                error_message += "• Consider transfer learning for small datasets"
+                error_message += "• Consider transfer learning for small datasets\n"
+                error_message += "• Use memory-efficient generators for large datasets"
             
             training_state['error_message'] = error_message
             print(f"❌ Training error details: {str(training_error)}")
             import traceback
             traceback.print_exc()
         
+        # Final memory cleanup
+        finally:
+            import gc
+            gc.collect()
+            print("🧹 Final memory cleanup completed")
+        
     except Exception as e:
         training_state['status'] = 'error'
         error_message = f"Setup error: {str(e)}"
+        
+        # Add specific error handling for common memory issues
+        if "memory" in str(e).lower() or "allocation" in str(e).lower():
+            error_message += "\n\n💡 This appears to be a memory issue. Try:\n"
+            error_message += "• Reducing the dataset size\n"
+            error_message += "• Using smaller images (resize to 128x128)\n"
+            error_message += "• Reducing batch size to 8 or 16\n"
+            error_message += "• Closing other applications\n"
+            error_message += "• Using a machine with more RAM"
+        
         training_state['error_message'] = error_message
         print(f"💥 Setup error: {str(e)}")
         import traceback
         traceback.print_exc()
-
-# Additional debugging and utility endpoints
+        
+        # Final cleanup on error
+        import gc
+        gc.collect()
 @app.route('/api/debug/training-state', methods=['GET'])
 def get_debug_training_state():
     """Get full training state for debugging (development only)"""

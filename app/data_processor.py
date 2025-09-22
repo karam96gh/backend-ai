@@ -7,6 +7,9 @@ import json
 import random
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
+import tensorflow as tf
+from tensorflow.keras.utils import Sequence
+import gc
 
 try:
     import cv2
@@ -14,10 +17,107 @@ except ImportError:
     cv2 = None
     print("Warning: OpenCV not available. Image processing will be limited.")
 
+class ImageDataGenerator(Sequence):
+    """Memory-efficient image data generator for large datasets"""
+    
+    def __init__(self, image_paths, labels, batch_size=32, target_size=(224, 224), 
+                 shuffle=True, augmentation=None, validation=False):
+        self.image_paths = image_paths
+        self.labels = labels
+        self.batch_size = batch_size
+        self.target_size = target_size
+        self.shuffle = shuffle
+        self.augmentation = augmentation
+        self.validation = validation
+        self.indices = np.arange(len(self.image_paths))
+        
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+    
+    def __len__(self):
+        return int(np.ceil(len(self.image_paths) / self.batch_size))
+    
+    def __getitem__(self, idx):
+        batch_indices = self.indices[idx * self.batch_size:(idx + 1) * self.batch_size]
+        batch_paths = [self.image_paths[i] for i in batch_indices]
+        batch_labels = [self.labels[i] for i in batch_indices]
+        
+        # Load and process images
+        batch_images = []
+        for path in batch_paths:
+            try:
+                img = self._load_and_preprocess_image(path)
+                batch_images.append(img)
+            except Exception as e:
+                print(f"Error loading image {path}: {e}")
+                # Create a blank image as fallback
+                blank_img = np.zeros((*self.target_size, 3), dtype=np.float32)
+                batch_images.append(blank_img)
+        
+        X = np.array(batch_images, dtype=np.float32)
+        y = np.array(batch_labels, dtype=np.int32)
+        
+        # Apply augmentation for training data
+        if self.augmentation and not self.validation:
+            X = self._apply_augmentation(X)
+        
+        return X, y
+    
+    def _load_and_preprocess_image(self, image_path):
+        """Load and preprocess a single image efficiently"""
+        try:
+            # Try OpenCV first (faster)
+            if cv2 is not None:
+                img = cv2.imread(image_path)
+                if img is not None:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    img = cv2.resize(img, self.target_size)
+                    img = img.astype(np.float32) / 255.0
+                    return img
+            
+            # Fallback to PIL
+            with Image.open(image_path) as pil_img:
+                if pil_img.mode != 'RGB':
+                    pil_img = pil_img.convert('RGB')
+                pil_img = pil_img.resize(self.target_size, Image.Resampling.LANCZOS)
+                img = np.array(pil_img, dtype=np.float32) / 255.0
+                return img
+                
+        except Exception as e:
+            print(f"Failed to load image {image_path}: {e}")
+            return np.zeros((*self.target_size, 3), dtype=np.float32)
+    
+    def _apply_augmentation(self, batch_images):
+        """Apply simple augmentation to batch"""
+        if self.augmentation is None:
+            return batch_images
+        
+        # Simple random horizontal flip
+        for i in range(len(batch_images)):
+            if np.random.random() > 0.5:
+                batch_images[i] = np.fliplr(batch_images[i])
+        
+        return batch_images
+    
+    def on_epoch_end(self):
+        """Shuffle indices after each epoch"""
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+
 class DataProcessor:
-    def __init__(self):
+    def __init__(self, max_memory_gb=4.0):
         self.scaler = StandardScaler()
         self.label_encoder = LabelEncoder()
+        self.max_memory_gb = max_memory_gb
+        self.max_images_in_memory = self._calculate_max_images()
+    
+    def _calculate_max_images(self):
+        """Calculate maximum number of images that can fit in memory"""
+        # Assume 224x224x3 float32 images (4 bytes per pixel)
+        bytes_per_image = 224 * 224 * 3 * 4
+        max_bytes = self.max_memory_gb * 1024**3
+        max_images = int(max_bytes * 0.7 / bytes_per_image)  # Use 70% of available memory
+        return max(100, max_images)  # At least 100 images
     
     def process_file(self, filepath, session_id=None):
         """Process uploaded file and return preview data"""
@@ -64,7 +164,7 @@ class DataProcessor:
             raise Exception(f"Error processing CSV file: {str(e)}")
     
     def _process_image_zip(self, filepath, session_id=None):
-        """Process ZIP file containing images"""
+        """Process ZIP file containing images with memory optimization"""
         try:
             extract_path = filepath.replace('.zip', '_extracted')
             os.makedirs(extract_path, exist_ok=True)
@@ -85,7 +185,12 @@ class DataProcessor:
             if not image_files:
                 raise Exception("No image files found in ZIP archive")
             
-            # Detect class structure (if organized in folders)
+            # Memory check
+            if len(image_files) > self.max_images_in_memory:
+                print(f"⚠️  Large dataset detected: {len(image_files)} images")
+                print(f"🧠 Will use generator-based training to manage memory")
+            
+            # Detect class structure
             classes = set()
             for img_path in image_files:
                 parent_dir = os.path.basename(os.path.dirname(img_path))
@@ -96,85 +201,44 @@ class DataProcessor:
             if session_id is None:
                 session_id = os.path.basename(filepath).split('_')[0]
             
-            # Sample random images for preview (up to 8)
-            # Try to get a balanced sample from different classes if they exist
+            # Sample images for preview (load only a few for memory efficiency)
             sample_images = []
-            max_samples = 8
+            max_samples = min(8, len(image_files))
             
             if classes and len(classes) > 1:
-                # Group images by class
+                # Balanced sampling from classes
                 images_by_class = {}
                 for img_path in image_files:
                     class_name = os.path.basename(os.path.dirname(img_path))
-                    if class_name != os.path.basename(extract_path):  # Skip if it's the root folder
+                    if class_name != os.path.basename(extract_path):
                         if class_name not in images_by_class:
                             images_by_class[class_name] = []
                         images_by_class[class_name].append(img_path)
                 
-                # Try to sample evenly from each class
+                # Sample from each class
                 images_per_class = max(1, max_samples // len(classes))
-                remaining_slots = max_samples
-                
-                # First pass: get at least one image from each class
                 for class_name, class_images in images_by_class.items():
-                    if remaining_slots <= 0:
-                        break
+                    sample_size = min(images_per_class, len(class_images))
+                    selected = random.sample(class_images, sample_size)
                     
-                    # Sample from this class
-                    sample_size = min(images_per_class, len(class_images), remaining_slots)
-                    selected_images = random.sample(class_images, sample_size)
-                    
-                    for img_path in selected_images:
-                        try:
-                            filename = os.path.basename(img_path)
-                            sample_images.append({
-                                'url': f'/api/preview-image/{session_id}/{filename}',
-                                'label': class_name
-                            })
-                            remaining_slots -= 1
-                        except:
-                            continue
-                
-                # Second pass: fill remaining slots randomly
-                if remaining_slots > 0:
-                    all_remaining_images = []
-                    for class_images in images_by_class.values():
-                        all_remaining_images.extend(class_images)
-                    
-                    # Remove already selected images
-                    selected_filenames = {sample['url'].split('/')[-1] for sample in sample_images}
-                    remaining_images = [img for img in all_remaining_images 
-                                      if os.path.basename(img) not in selected_filenames]
-                    
-                    if remaining_images:
-                        additional_count = min(remaining_slots, len(remaining_images))
-                        additional_images = random.sample(remaining_images, additional_count)
-                        
-                        for img_path in additional_images:
-                            try:
-                                filename = os.path.basename(img_path)
-                                class_name = os.path.basename(os.path.dirname(img_path))
-                                sample_images.append({
-                                    'url': f'/api/preview-image/{session_id}/{filename}',
-                                    'label': class_name
-                                })
-                            except:
-                                continue
-            else:
-                # No class structure or single class - just random sample
-                sample_count = min(max_samples, len(image_files))
-                random_image_files = random.sample(image_files, sample_count)
-                
-                for i, img_path in enumerate(random_image_files):
-                    try:
+                    for img_path in selected:
+                        if len(sample_images) >= max_samples:
+                            break
                         filename = os.path.basename(img_path)
-                        class_label = os.path.basename(os.path.dirname(img_path)) if classes else f'Image {i+1}'
                         sample_images.append({
                             'url': f'/api/preview-image/{session_id}/{filename}',
-                            'label': class_label
+                            'label': class_name
                         })
-                    except:
-                        continue
+            else:
+                # Random sampling
+                selected_paths = random.sample(image_files, max_samples)
+                for i, img_path in enumerate(selected_paths):
+                    filename = os.path.basename(img_path)
+                    class_label = os.path.basename(os.path.dirname(img_path)) if classes else f'Image {i+1}'
+                    sample_images.append({
+                        'url': f'/api/preview-image/{session_id}/{filename}',
+                        'label': class_label
+                    })
             
             preview_data = {
                 'type': 'images',
@@ -182,7 +246,13 @@ class DataProcessor:
                 'classes': len(classes) if classes else None,
                 'class_names': list(classes) if classes else None,
                 'samples': sample_images,
-                'extract_path': extract_path
+                'extract_path': extract_path,
+                'use_generator': len(image_files) > self.max_images_in_memory,
+                'memory_info': {
+                    'max_images_in_memory': self.max_images_in_memory,
+                    'estimated_memory_gb': len(image_files) * 224 * 224 * 3 * 4 / (1024**3),
+                    'will_use_generator': len(image_files) > self.max_images_in_memory
+                }
             }
             
             return preview_data
@@ -196,7 +266,6 @@ class DataProcessor:
             img = Image.open(filepath)
             width, height = img.size
             
-            # Extract session_id from filepath if not provided
             if session_id is None:
                 session_id = os.path.basename(filepath).split('_')[0]
             
@@ -210,7 +279,8 @@ class DataProcessor:
                 }],
                 'dimensions': f"{width}x{height}",
                 'mode': img.mode,
-                'extract_path': os.path.dirname(filepath)  # For consistency with zip processing
+                'extract_path': os.path.dirname(filepath),
+                'use_generator': False
             }
             
             return preview_data
@@ -219,13 +289,16 @@ class DataProcessor:
             raise Exception(f"Error processing image: {str(e)}")
     
     def prepare_training_data(self, filepath, validation_split=0.2, task_type='classification'):
-        """Prepare data for training"""
+        """Prepare data for training with memory optimization"""
         preview_data = self.process_file(filepath)
         
         if preview_data['type'] == 'csv':
             return self._prepare_csv_data(filepath, validation_split, task_type)
         elif preview_data['type'] == 'images':
-            return self._prepare_image_data(preview_data, validation_split, task_type)
+            if preview_data.get('use_generator', False):
+                return self._prepare_image_data_generator(preview_data, validation_split, task_type)
+            else:
+                return self._prepare_image_data_memory(preview_data, validation_split, task_type)
         else:
             raise ValueError("Unsupported data type for training")
     
@@ -244,31 +317,23 @@ class DataProcessor:
         for col in categorical_columns:
             X.loc[:, col] = LabelEncoder().fit_transform(X[col].astype(str))
         
-        # ✅ حفظ أسماء الفئات الأصلية
+        # Handle labels
         original_class_names = None
         if task_type == 'classification':
             if y.dtype == 'object':
-                # ✅ احتفظ بالأسماء الأصلية قبل التحويل
                 original_class_names = sorted(y.unique().tolist())
                 y = self.label_encoder.fit_transform(y)
             else:
-                # إذا كانت رقمية، احتفظ بالقيم الفريدة
                 original_class_names = sorted(y.unique().tolist())
             
-            # إعادة ترقيم التصنيفات
             unique_classes = np.unique(y)
             num_classes = len(unique_classes)
             
             y_mapped = np.zeros_like(y)
             for new_idx, old_class in enumerate(unique_classes):
                 y_mapped[y == old_class] = new_idx
-            
             y = y_mapped.astype(np.int32)
-            
-            print(f"📊 Original classes: {original_class_names}")
-            print(f"📊 Mapped to: {np.arange(num_classes)}")
-            
-        else:  # regression
+        else:
             y = pd.to_numeric(y, errors='coerce')
             if y.isna().sum() > 0:
                 valid_indices = ~y.isna()
@@ -292,28 +357,85 @@ class DataProcessor:
             'num_classes': num_classes,
             'task_type': task_type,
             'data_type': 'tabular',
-            'class_names': original_class_names,  # ✅ الأسماء الأصلية
+            'class_names': original_class_names,
             'feature_names': feature_columns.tolist(),
             'target_name': target_column
         }
         
         return X_train_scaled, X_val_scaled, y_train, y_val, data_info
-    def _prepare_image_data(self, preview_data, validation_split, task_type):
-        """Prepare image data for training"""
-        if 'extract_path' in preview_data:
-            extract_path = preview_data['extract_path']
-        else:
-            # Handle single image case
-            raise Exception("Single image training not implemented yet")
+    
+    def _prepare_image_data_generator(self, preview_data, validation_split, task_type):
+        """Prepare image data using generators for large datasets"""
+        extract_path = preview_data['extract_path']
+        
+        # Collect all image paths and labels
+        image_paths = []
+        labels = []
+        
+        image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff'}
+        
+        if preview_data.get('class_names'):
+            label_to_idx = {label: idx for idx, label in enumerate(preview_data['class_names'])}
+            
+            for root, dirs, files in os.walk(extract_path):
+                class_name = os.path.basename(root)
+                if class_name in label_to_idx:
+                    for file in files:
+                        if os.path.splitext(file)[1].lower() in image_extensions:
+                            img_path = os.path.join(root, file)
+                            image_paths.append(img_path)
+                            labels.append(label_to_idx[class_name])
+        
+        if not image_paths:
+            raise Exception("No valid images found for training")
+        
+        # Convert to numpy arrays
+        image_paths = np.array(image_paths)
+        labels = np.array(labels)
+        
+        # Split indices
+        indices = np.arange(len(image_paths))
+        train_idx, val_idx = train_test_split(
+            indices, test_size=validation_split, random_state=42,
+            stratify=labels if task_type == 'classification' else None
+        )
+        
+        # Create generators
+        train_generator = ImageDataGenerator(
+            image_paths[train_idx], labels[train_idx],
+            batch_size=32, shuffle=True, validation=False
+        )
+        
+        val_generator = ImageDataGenerator(
+            image_paths[val_idx], labels[val_idx],
+            batch_size=32, shuffle=False, validation=True
+        )
+        
+        data_info = {
+            'input_shape': (224, 224, 3),
+            'num_classes': len(np.unique(labels)) if task_type == 'classification' else 1,
+            'task_type': task_type,
+            'data_type': 'images',
+            'class_names': preview_data.get('class_names'),
+            'use_generator': True,
+            'total_samples': len(image_paths),
+            'train_samples': len(train_idx),
+            'val_samples': len(val_idx)
+        }
+        
+        return train_generator, val_generator, None, None, data_info
+    
+    def _prepare_image_data_memory(self, preview_data, validation_split, task_type):
+        """Prepare image data loading all into memory (for smaller datasets)"""
+        extract_path = preview_data['extract_path']
         
         # Load images and labels
         images = []
         labels = []
         
         image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff'}
-        target_size = (224, 224)  # Standard size for most models
+        target_size = (224, 224)
         
-        # If organized in folders (class structure)
         if preview_data.get('class_names'):
             label_to_idx = {label: idx for idx, label in enumerate(preview_data['class_names'])}
             
@@ -327,50 +449,30 @@ class DataProcessor:
                                 if cv2 is not None:
                                     img = cv2.imread(img_path)
                                     img = cv2.resize(img, target_size)
-                                    img = img / 255.0  # Normalize
+                                    img = img.astype(np.float32) / 255.0
                                 else:
-                                    # Fallback to PIL
                                     img = Image.open(img_path)
                                     img = img.resize(target_size)
-                                    img = np.array(img) / 255.0
-                                    if len(img.shape) == 2:  # Grayscale
-                                        img = np.stack([img] * 3, axis=-1)  # Convert to RGB
+                                    img = np.array(img, dtype=np.float32) / 255.0
+                                    if len(img.shape) == 2:
+                                        img = np.stack([img] * 3, axis=-1)
                                 
                                 images.append(img)
                                 labels.append(label_to_idx[class_name])
+                                
                             except Exception as e:
                                 print(f"Error processing image {img_path}: {e}")
                                 continue
-        else:
-            # No class structure - create dummy labels for unsupervised/autoencoder tasks
-            for root, dirs, files in os.walk(extract_path):
-                for file in files:
-                    if os.path.splitext(file)[1].lower() in image_extensions:
-                        img_path = os.path.join(root, file)
-                        try:
-                            if cv2 is not None:
-                                img = cv2.imread(img_path)
-                                img = cv2.resize(img, target_size)
-                                img = img / 255.0
-                            else:
-                                # Fallback to PIL
-                                img = Image.open(img_path)
-                                img = img.resize(target_size)
-                                img = np.array(img) / 255.0
-                                if len(img.shape) == 2:  # Grayscale
-                                    img = np.stack([img] * 3, axis=-1)  # Convert to RGB
-                            
-                            images.append(img)
-                            labels.append(0)  # Dummy label
-                        except Exception as e:
-                            print(f"Error processing image {img_path}: {e}")
-                            continue
         
         if not images:
             raise Exception("No valid images found for training")
         
-        X = np.array(images)
-        y = np.array(labels)
+        X = np.array(images, dtype=np.float32)
+        y = np.array(labels, dtype=np.int32)
+        
+        # Force garbage collection
+        del images
+        gc.collect()
         
         # Split data
         X_train, X_val, y_train, y_val = train_test_split(
@@ -378,10 +480,12 @@ class DataProcessor:
         )
         
         data_info = {
-            'input_shape': X_train.shape[1:],  # (height, width, channels)
+            'input_shape': X_train.shape[1:],
             'num_classes': len(np.unique(y)) if task_type == 'classification' else 1,
             'task_type': task_type,
-            'data_type': 'images'
+            'data_type': 'images',
+            'class_names': preview_data.get('class_names'),
+            'use_generator': False
         }
         
         return X_train, X_val, y_train, y_val, data_info
