@@ -39,6 +39,16 @@ class ImageDataLoaderEfficientNet:
                 file_path = os.path.join(root, file)
                 file_ext = os.path.splitext(file)[1].lower()
 
+                # تخطي الملفات المخفية
+                if file.startswith('.'):
+                    try:
+                        os.remove(file_path)
+                        removed_count += 1
+                        print(f"Removed hidden file: {file_path}")
+                    except Exception as e:
+                        print(f"Error removing {file_path}: {e}")
+                    continue
+
                 # حذف الملفات غير المدعومة
                 if file_ext not in valid_extensions:
                     try:
@@ -49,10 +59,17 @@ class ImageDataLoaderEfficientNet:
                         print(f"Error removing {file_path}: {e}")
                     continue
 
-                # التحقق من صحة الصورة
+                # التحقق من صحة الصورة بشكل شامل
                 try:
+                    # فتح الصورة
                     img = Image.open(file_path)
-                    img.verify()  # التحقق من صحة الصورة
+                    # تحويل الصورة لـ RGB (يكشف الأخطاء المخفية)
+                    img = img.convert('RGB')
+                    # محاولة تحميل البيانات فعلياً
+                    img.load()
+                    # التحقق من الأبعاد
+                    if img.size[0] < 10 or img.size[1] < 10:
+                        raise Exception("Image too small")
                     img.close()
                 except Exception as e:
                     try:
@@ -64,6 +81,8 @@ class ImageDataLoaderEfficientNet:
 
         if removed_count > 0:
             print(f"✅ Cleaned {removed_count} invalid/corrupted files")
+        else:
+            print(f"✅ No corrupted files found")
         return removed_count
 
     def load_image_dataset(self, data_dir, validation_split=0.2, seed=42):
