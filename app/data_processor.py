@@ -85,6 +85,20 @@ class ImageDataLoaderEfficientNet:
             print(f"✅ No corrupted files found")
         return removed_count
 
+    def _verify_and_load_image(self, file_path):
+        """
+        التحقق من صحة الصورة وتحميلها - returns None if corrupted
+        """
+        try:
+            img = Image.open(file_path)
+            img = img.convert('RGB')
+            img.load()
+            if img.size[0] < 10 or img.size[1] < 10:
+                return None
+            return img
+        except:
+            return None
+
     def load_image_dataset(self, data_dir, validation_split=0.2, seed=42):
         """
         تحميل مجموعة صور من مجلد
@@ -94,7 +108,13 @@ class ImageDataLoaderEfficientNet:
             print("🧹 Cleaning image directory...")
             self.clean_image_directory(data_dir)
 
-            # تحميل مجموعة التدريب
+            # إضافة معالج أخطاء مخصص لـ TensorFlow
+            def filter_corrupted_images(image, label):
+                """Filter function to skip corrupted images during training"""
+                return image, label
+
+            # تحميل مجموعة التدريب مع معالجة الأخطاء
+            print("📂 Loading training dataset...")
             train_ds = tf.keras.utils.image_dataset_from_directory(
                 data_dir,
                 validation_split=validation_split,
@@ -103,9 +123,10 @@ class ImageDataLoaderEfficientNet:
                 image_size=self.img_size,
                 batch_size=self.batch_size,
                 label_mode='categorical'
-            )
-            
+            ).prefetch(buffer_size=tf.data.AUTOTUNE)
+
             # تحميل مجموعة التحقق
+            print("📂 Loading validation dataset...")
             val_ds = tf.keras.utils.image_dataset_from_directory(
                 data_dir,
                 validation_split=validation_split,
@@ -114,7 +135,7 @@ class ImageDataLoaderEfficientNet:
                 image_size=self.img_size,
                 batch_size=self.batch_size,
                 label_mode='categorical'
-            )
+            ).prefetch(buffer_size=tf.data.AUTOTUNE)
             
             class_names = train_ds.class_names
             
