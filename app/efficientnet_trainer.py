@@ -48,6 +48,9 @@ class EfficientNetV2Trainer:
     def build_model(self):
         """
         بناء نموذج EfficientNetV2B0 مع رأس تصنيف
+
+        ملاحظة مهمة: لا نستخدم preprocessing داخل النموذج لتمكين Grad-CAM.
+        Preprocessing يتم تطبيقه في preprocessing pipeline خارجياً.
         """
         logger.info("Building EfficientNetV2B0 model...")
 
@@ -57,22 +60,27 @@ class EfficientNetV2Trainer:
             include_top=False,
             input_shape=self.img_size + (3,)
         )
-        
+
         # تجميد الطبقات في البداية
         base_model.trainable = False
-        
+
         # بناء النموذج الكامل
         inputs = keras.Input(shape=self.img_size + (3,))
-        
-        # Preprocessing - using B0 preprocessing
-        x = tf.keras.applications.efficientnet_v2.preprocess_input(inputs)
-        
+
+        # ❌ لا نستخدم preprocess_input هنا!
+        # ✅ سيتم التطبيق في data pipeline
+        # x = tf.keras.applications.efficientnet_v2.preprocess_input(inputs)
+
+        # Rescaling manual (بدلاً من preprocess_input)
+        # EfficientNet preprocessing: scale to [-1, 1]
+        x = layers.Rescaling(scale=1./127.5, offset=-1)(inputs)
+
         # Base model
         x = base_model(x, training=False)
-        
+
         # Global Average Pooling
         x = layers.GlobalAveragePooling2D()(x)
-        
+
         # رأس التصنيف
         x = layers.BatchNormalization()(x)
         x = layers.Dropout(0.5)(x)
@@ -82,10 +90,10 @@ class EfficientNetV2Trainer:
         x = layers.Dense(256, activation="relu")(x)
         x = layers.Dropout(0.2)(x)
         outputs = layers.Dense(self.num_classes, activation="softmax")(x)
-        
+
         model = keras.Model(inputs, outputs)
-        
-        logger.info("Model built successfully!")
+
+        logger.info("Model built successfully (Grad-CAM compatible)!")
         return model, base_model
     
     def compile_model(self, model, learning_rate=1e-3):

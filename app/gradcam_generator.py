@@ -47,131 +47,75 @@ class GradCAMGenerator:
     
     def make_gradcam_heatmap(self, img_preprocessed, pred_class_idx):
         """
-        حساب Grad-CAM heatmap - محسّن للعمل مع EfficientNet
+        حساب Grad-CAM heatmap - طريقة مبسطة تعمل مع Rescaling layer
         """
         try:
-            # إيجاد النموذج الفرعي EfficientNet (إذا كان موجوداً)
-            efficientnet_model = None
-            last_conv_layer_name = None
-
             # 1. ابحث عن النموذج الفرعي EfficientNet
+            efficientnet_layer = None
             for layer in self.model.layers:
-                # تحقق من أن هذه الطبقة هي نموذج EfficientNet
                 if hasattr(layer, 'name') and 'efficientnet' in layer.name.lower():
-                    efficientnet_model = layer
+                    efficientnet_layer = layer
                     logger.info(f"Found EfficientNet base model: {layer.name}")
                     break
-                # أو تحقق من أن لديها طبقات فرعية وإحداها اسمها top_conv
-                if hasattr(layer, 'layers'):
-                    try:
-                        # حاول إيجاد top_conv في الطبقات الفرعية
-                        for sublayer in layer.layers:
-                            if sublayer.name == 'top_conv':
-                                efficientnet_model = layer
-                                logger.info(f"Found model containing top_conv: {layer.name}")
-                                break
-                    except:
-                        pass
-                if efficientnet_model:
+
+            if efficientnet_layer is None:
+                logger.warning("EfficientNet layer not found")
+                return self._simple_saliency_map(img_preprocessed, pred_class_idx)
+
+            # 2. ابحث عن آخر طبقة Conv داخل EfficientNet
+            target_layer_name = None
+            target_layers = ['top_conv', 'block7a_project_conv', 'block6a_expand_conv']
+            for layer_name in target_layers:
+                try:
+                    efficientnet_layer.get_layer(layer_name)
+                    target_layer_name = layer_name
+                    logger.info(f"Found target conv layer: {layer_name}")
                     break
+                except:
+                    continue
 
-            # 2. إذا وجدنا النموذج الفرعي، ابحث عن طبقة Conv فيه
-            if efficientnet_model:
-                known_layers = ['top_conv', 'block7a_project_conv', 'block6a_expand_conv']
-                for layer_name in known_layers:
-                    try:
-                        # ابحث في النموذج الفرعي
-                        test_layer = None
-                        for sublayer in efficientnet_model.layers:
-                            if sublayer.name == layer_name:
-                                test_layer = sublayer
-                                break
-
-                        if test_layer:
-                            last_conv_layer_name = layer_name
-                            logger.info(f"Found conv layer in base model: {layer_name}")
-                            break
-                    except:
-                        continue
-
-            # 3. إذا لم نجد، ابحث في النموذج الرئيسي
-            if last_conv_layer_name is None:
-                logger.info("Searching for conv layers in main model...")
-                for layer in reversed(self.model.layers):
-                    if isinstance(layer, keras.layers.Conv2D):
-                        last_conv_layer_name = layer.name
-                        logger.info(f"Found direct conv layer: {layer.name}")
-                        break
-
-            if last_conv_layer_name is None:
-                logger.warning("No Conv layer found, using fallback saliency map")
+            if target_layer_name is None:
+                logger.warning("No suitable conv layer found")
                 return self._simple_saliency_map(img_preprocessed, pred_class_idx)
 
-            logger.info(f"Using layer for Grad-CAM: {last_conv_layer_name}")
-
-            # 4. إنشاء نموذج Grad-CAM - استخدم النموذج الفرعي إذا كان متاحاً
+            # 3. إنشاء grad_model - الآن يجب أن يعمل لأن rescaling layer بسيطة
             try:
-                if efficientnet_model and last_conv_layer_name:
-                    # إنشاء grad_model من النموذج الأساسي إلى النموذج الفرعي
-                    # احصل على الطبقة من النموذج الفرعي
-                    conv_layer = None
-                    for sublayer in efficientnet_model.layers:
-                        if sublayer.name == last_conv_layer_name:
-                            conv_layer = sublayer
-                            break
+                # احصل على output الطبقة المستهدفة
+                conv_layer_output = efficientnet_layer.get_layer(target_layer_name).output
 
-                    if conv_layer is None:
-                        raise Exception(f"Could not find {last_conv_layer_name} in base model")
+                grad_model = keras.Model(
+                    inputs=self.model.input,
+                    outputs=[conv_layer_output, self.model.output]
+                )
+                logger.info("Grad-CAM model created successfully")
 
-                    # إنشاء النموذج باستخدام output الطبقة
-                    grad_model = keras.Model(
-                        inputs=self.model.input,
-                        outputs=[conv_layer.output, self.model.output]
-                    )
-                else:
-                    # استخدم الطريقة العادية
-                    grad_model = keras.Model(
-                        inputs=self.model.input,
-                        outputs=[
-                            self.model.get_layer(last_conv_layer_name).output,
-                            self.model.output
-                        ]
-                    )
             except Exception as e:
-                logger.warning(f"Could not create grad_model: {str(e)}")
-                logger.info("Falling back to saliency map method")
+                logger.error(f"Could not create grad_model: {str(e)}")
                 return self._simple_saliency_map(img_preprocessed, pred_class_idx)
 
-            # حساب gradients باستخدام GradientTape
+            # 4. حساب Gradients
             with tf.GradientTape() as tape:
-                # احصل على الـ outputs
                 conv_outputs, predictions = grad_model(img_preprocessed, training=False)
-                # احصل على القناة المطلوبة
                 class_channel = predictions[:, pred_class_idx]
 
-            # احسب gradients
             grads = tape.gradient(class_channel, conv_outputs)
 
             if grads is None:
-                logger.warning("Gradients are None, using fallback method")
+                logger.warning("Gradients are None")
                 return self._simple_saliency_map(img_preprocessed, pred_class_idx)
 
-            # حساب الأوزان (Global Average Pooling على الـ gradients)
+            # 5. حساب Grad-CAM heatmap
             pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-
-            # إنشاء heatmap
             conv_output = conv_outputs[0]
             heatmap = conv_output @ pooled_grads[..., tf.newaxis]
             heatmap = tf.squeeze(heatmap)
-
-            # تطبيع الـ heatmap
             heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-10)
 
+            logger.info("✅ Grad-CAM heatmap computed successfully!")
             return heatmap.numpy()
 
         except Exception as e:
-            logger.error(f"Error in make_gradcam_heatmap: {str(e)}")
-            logger.info("Using fallback saliency map method")
+            logger.error(f"Error in Grad-CAM: {str(e)}")
             return self._simple_saliency_map(img_preprocessed, pred_class_idx)
     
     def _simple_saliency_map(self, img_preprocessed, pred_class_idx):
