@@ -1623,7 +1623,18 @@ def train_efficientnet_background(config, data_info):
         
         # دمج الـ histories
         combined_history = EfficientNetV2Trainer.combine_histories(history1, history2)
-        
+
+        # Update training_state with combined history
+        training_state['history'] = []
+        for i in range(len(combined_history['accuracy'])):
+            training_state['history'].append({
+                'epoch': i + 1,
+                'loss': float(combined_history['loss'][i]),
+                'accuracy': float(combined_history['accuracy'][i]),
+                'val_loss': float(combined_history['val_loss'][i]),
+                'val_accuracy': float(combined_history['val_accuracy'][i])
+            })
+
         # تقييم النموذج
         print("\n📈 Evaluating model...")
         eval_results = trainer.evaluate_model(model, val_ds_prepared)
@@ -1670,7 +1681,8 @@ def train_efficientnet_background(config, data_info):
         training_state['results'] = final_results
         training_state['status'] = 'completed'
         training_state['progress'] = 100
-        
+        training_state['epoch'] = int(len(combined_history['accuracy']))  # Total epochs completed
+
         print("✅ Training completed successfully!")
         print(f"📊 Final Validation Accuracy: {final_results['final_val_accuracy']:.2%}")
         print(f"🎯 Best Accuracy: {final_results['best_accuracy']:.2%} at epoch {final_results['best_epoch']}")
